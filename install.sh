@@ -1,35 +1,44 @@
 #!/usr/bin/env bash
 # 安装 agnes-skills：把技能软链到 agent 的技能目录，把工具软链到 PATH。
 #
-#   ./install.sh              # 软链安装（默认）
+#   ./install.sh
 #   AGNES_BIN_HOME=~/.bin ./install.sh
 #   DSH_AGENTS_HOME=~/.agents ./install.sh
+#   AGNES_HOMEBREW_LINK=0 ./install.sh     # 不往 /opt/homebrew/bin 建链
+#
+# 已存在的真实目录/文件会先备份为 *.bak-<时间戳> 再建链，不会被覆盖丢失。
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_HOME="${DSH_AGENTS_HOME:-$HOME/.agents}/skills"
 BIN_HOME="${AGNES_BIN_HOME:-$HOME/.local/bin}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+link() {  # link <target> <linkpath>
+  local target="$1" dest="$2"
+  if [[ -e "$dest" && ! -L "$dest" ]]; then
+    mv "$dest" "$dest.bak-$STAMP"
+    echo "backup $dest.bak-$STAMP"
+  fi
+  ln -sfn "$target" "$dest"
+  echo "link   $dest -> $target"
+}
 
 mkdir -p "$SKILL_HOME" "$BIN_HOME"
 
 for dir in "$ROOT"/skills/*/; do
-  name="$(basename "$dir")"
-  ln -sfn "$dir" "$SKILL_HOME/$name"
-  echo "skill  $SKILL_HOME/$name"
+  link "$dir" "$SKILL_HOME/$(basename "$dir")"
 done
 
 for file in "$ROOT"/tools/*; do
   chmod +x "$file"
-  ln -sfn "$file" "$BIN_HOME/$(basename "$file")"
-  echo "tool   $BIN_HOME/$(basename "$file")"
+  link "$file" "$BIN_HOME/$(basename "$file")"
 done
 
-# launchd / systemd 服务常常拿不到 ~/.local/bin，额外链一份到 homebrew 目录
-if [[ -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
+if [[ "${AGNES_HOMEBREW_LINK:-1}" != "0" && -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
   for file in "$ROOT"/tools/*; do
-    ln -sfn "$file" "/opt/homebrew/bin/$(basename "$file")"
-    echo "tool   /opt/homebrew/bin/$(basename "$file")"
+    link "$file" "/opt/homebrew/bin/$(basename "$file")"
   done
 fi
 
