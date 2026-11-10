@@ -32,12 +32,14 @@ for dir in "$ROOT"/skills/*/; do
 done
 
 for file in "$ROOT"/tools/*; do
-  chmod +x "$file"
+  [[ -f "$file" ]] || continue
+  chmod 755 "$file"
   link "$file" "$BIN_HOME/$(basename "$file")"
 done
 
 if [[ "${AGNES_HOMEBREW_LINK:-1}" != "0" && -d /opt/homebrew/bin && -w /opt/homebrew/bin ]]; then
   for file in "$ROOT"/tools/*; do
+    [[ -f "$file" ]] || continue
     link "$file" "/opt/homebrew/bin/$(basename "$file")"
   done
 fi
