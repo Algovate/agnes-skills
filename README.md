@@ -33,7 +33,7 @@ agnes-img --prompt "..."                             # ✅ 默认就是 2.5
 ## 安装
 
 ```bash
-git clone git@github.com:derekluo/agnes-skills.git
+git clone git@github.com:Algovate/agnes-skills.git
 cd agnes-skills
 ./install.sh
 ```
