@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""agnes-img — Agnes 图像生成，带模型选择与自动降级。
+
+默认走 agnes-image-2.5-flash；2.5 上游故障时自动降级到 2.1。
+CLI 的 agnes image generate 只支持 2.0/2.1，2.5 只能走原始 API，故有此壳。
+
+契约（与 agnes image generate 对齐）：
+  - stdout 只输出结果 URL（每行一个）
+  - stderr 输出模型名、task_id、降级告警、错误
+  - --dry-run 不联网，只打印请求体
+
+模型优先级：--model > $AGNES_IMAGE_MODEL > 2.5
+降级开关：--no-fallback 或 $AGNES_IMAGE_FALLBACK=0
+"""
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+MODELS = {
+    "2.5": "agnes-image-2.5-flash",
+    "2.1": "agnes-image-2.1-flash",
+    "2.0": "agnes-image-2.0-flash",
+}
+FALLBACK = {"agnes-image-2.5-flash": "agnes-image-2.1-flash"}
+DEFAULT_MODEL = "2.5"
+DEFAULT_BASE = "https://apihub.agnes-ai.com"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def die(msg, code=1):
+    print(f"agnes-img: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def api_key():
+    key = os.environ.get("AGNES_API_KEY")
+    if key:
+        return key.strip()
+
+    # agnes CLI 在不同环境下把 key 写到不同地方：无钥匙串时落到 config.yml
+    config_dir = os.environ.get("AGNES_CONFIG_DIR") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "agnes"
+    )
+    config_path = os.path.join(config_dir, "config.yml")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip().startswith("api_key:"):
+                    value = line.split(":", 1)[1].strip().strip("'\"")
+                    if value:
+                        return value
+
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "agnes-cli", "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+
+    die("找不到 API key：设置 AGNES_API_KEY，或先执行 `agnes key set <key>`", 2)
+
+
+def resolve_model(raw):
+    if raw in MODELS:
+        return MODELS[raw]
+    if raw in MODELS.values():
+        return raw
+    die(f"不支持的模型 {raw!r}，可选：{', '.join(MODELS)} 或完整模型 id", 2)
+
+
+def as_image(value):
+    if value.startswith(("http://", "https://", "data:")):
+        return value
+    if not os.path.isfile(value):
+        die(f"图片不存在：{value}", 2)
+    mime = mimetypes.guess_type(value)[0] or "image/png"
+    with open(value, "rb") as fh:
+        encoded = base64.b64encode(fh.read()).decode()
+    log(f"image {value} -> {mime} data uri ({len(encoded)} b64 chars)")
+    return f"data:{mime};base64,{encoded}"
+
+
+def build_body(model, args, images):
+    body = {"model": model, "prompt": args.prompt, "size": args.size}
+    if images:
+        body["extra_body"] = {"image": images, "response_format": "url"}
+    return body
+
+
+def post(base, key, body, timeout):
+    url = base.rstrip("/") + "/v1/images/generations"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            return exc.code, json.loads(raw)
+        except Exception:
+            return exc.code, {"raw": raw}
+    except Exception as exc:  # 网络层失败
+        return 0, {"raw": f"{type(exc).__name__}: {exc}"}
+
+
+def urls_of(payload):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    return [item["url"] for item in data if isinstance(item, dict) and item.get("url")]
+
+
+def error_text(payload):
+    if not isinstance(payload, dict):
+        return str(payload)[:300]
+    err = payload.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or json.dumps(err)[:300]
+    return payload.get("message") or str(payload.get("raw", ""))[:300]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agnes-img",
+        description="Agnes 图像生成（默认 2.5，失败自动降级 2.1）",
+    )
+    parser.add_argument("--prompt", required=True, help="提示词 / 改图指令")
+    parser.add_argument("--image", action="append", default=[], help="参考图：URL / Data URI / 本地路径，可重复")
+    parser.add_argument("--size", default="1024x768", help="尺寸档位或精确值，默认 1024x768")
+    parser.add_argument("--model", help="2.5 | 2.1 | 2.0 | 完整模型 id（默认 2.5）")
+    parser.add_argument("--no-fallback", action="store_true", help="2.5 失败时不降级到 2.1")
+    parser.add_argument("--dry-run", action="store_true", help="只打印请求体，不发起请求")
+    parser.add_argument("--timeout", type=int, default=300, help="HTTP 超时秒数，默认 300")
+    parser.add_argument("--base-url", default=os.environ.get("AGNES_API_BASE_URL") or DEFAULT_BASE,
+                        help="API 基地址")
+    args = parser.parse_args()
+
+    model = resolve_model(args.model or os.environ.get("AGNES_IMAGE_MODEL") or DEFAULT_MODEL)
+    images = [as_image(v) for v in args.image]
+
+    if args.dry_run:
+        print(json.dumps({"model": model, "request": build_body(model, args, images)},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    key = api_key()
+    fallback_enabled = not args.no_fallback and os.environ.get("AGNES_IMAGE_FALLBACK", "1") != "0"
+
+    attempts = [(model, "primary")]
+    fallback = FALLBACK.get(model)
+    if fallback and fallback_enabled:
+        attempts.append((fallback, "fallback"))
+
+    last = None
+    for candidate, role in attempts:
+        log(f"model={candidate} role={role}")
+        status, payload = post(args.base_url, key, build_body(candidate, args, images), args.timeout)
+        urls = urls_of(payload)
+        if status == 200 and urls:
+            task = payload.get("task_id")
+            if task:
+                log(f"task_id={task}")
+            log(f"generated with {candidate}")
+            print("\n".join(urls))
+            return 0
+        last = (candidate, status, payload)
+        log(f"{candidate} failed: status={status} {error_text(payload)}")
+        # 参数类错误换个模型也一样，直接退出
+        if status in (400, 401, 403, 422):
+            break
+
+    candidate, status, payload = last
+    log(f"agnes-img: 全部失败（最后一次 {candidate}, status={status}）")
+    return 2 if status in (400, 401, 422) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# agnes-gc — 清理 output/drafts 下的中间稿；output/ 里的交付图永不自动删除。
+#
+# 用法：
+#   agnes-gc                      # 预览：将删除 drafts 中超过 7 天的文件
+#   agnes-gc --days 3             # 预览：超过 3 天的
+#   agnes-gc --apply              # 执行删除（超过 7 天）
+#   agnes-gc --all --apply        # 清空整个 drafts
+#   agnes-gc --dir ~/x/output/drafts
+#
+# 安全约束：目标目录的 basename 必须是 drafts，防止手滑删到交付图。
+
+set -euo pipefail
+
+DAYS=7
+APPLY=0
+ALL=0
+DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --days) DAYS="${2:?}"; shift 2 ;;
+    --apply) APPLY=1; shift ;;
+    --all) ALL=1; shift ;;
+    --dir) DIR="${2:?}"; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "agnes-gc: 未知参数 $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$DIR" ]]; then
+  if [[ -d "output/drafts" ]]; then
+    DIR="output/drafts"
+  else
+    DIR="$HOME/.dsh/weixin/sessions/output/drafts"
+  fi
+fi
+
+if [[ ! -d "$DIR" ]]; then
+  echo "agnes-gc: 目录不存在：$DIR" >&2
+  exit 1
+fi
+
+if [[ "$(basename "$(cd "$DIR" && pwd)")" != "drafts" ]]; then
+  echo "agnes-gc: 拒绝执行——目标目录必须以 drafts 结尾（当前 ${DIR}）" >&2
+  exit 2
+fi
+
+if [[ "$ALL" -eq 1 ]]; then
+  FIND_ARGS=(-type f)
+  LABEL="全部"
+else
+  FIND_ARGS=(-type f -mtime +"$DAYS")
+  LABEL="超过 ${DAYS} 天"
+fi
+
+FILES=()
+while IFS= read -r f; do
+  FILES+=("$f")
+done < <(find "$DIR" "${FIND_ARGS[@]}" -print 2>/dev/null | sort)
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "agnes-gc: $DIR 中没有${LABEL}的文件，无需清理"
+  exit 0
+fi
+
+TOTAL=0
+for f in "${FILES[@]}"; do
+  sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+  TOTAL=$((TOTAL + sz))
+done
+HUMAN=$(awk -v b="$TOTAL" 'BEGIN{printf "%.1f MB", b/1048576}')
+
+echo "agnes-gc: $DIR 中${LABEL}的文件 ${#FILES[@]} 个，共 ${HUMAN}"
+for f in "${FILES[@]}"; do
+  printf "  %s\n" "${f#"$DIR"/}"
+done
+
+if [[ "$APPLY" -eq 1 ]]; then
+  for f in "${FILES[@]}"; do
+    rm -f "$f"
+  done
+  echo "已删除 ${#FILES[@]} 个文件，释放 ${HUMAN}"
+else
+  echo "（预览模式，未删除；加 --apply 执行）"
+fi
